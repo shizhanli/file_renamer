@@ -80,12 +80,40 @@ def build_plan(root: Path) -> List[PlanItem]:
   return plan
 
 
-def write_report(repo_root: Path, plan: List[PlanItem]) -> Path:
+def apply_plan(plan: List[PlanItem]) -> None:
+  for item in plan:
+    if item.status != "PLAN":
+      continue
+
+    folder = Path(item.folder)
+    src = folder / item.old_name
+    dst = folder / item.new_name
+
+    if not src.exists():
+      item.status = "ERROR"
+      item.note = "source missing"
+      continue
+
+    if dst.exists():
+      item.status = "SKIP"
+      item.note = "target exists"
+      continue
+
+    try:
+      src.rename(dst)
+      item.status = "DONE"
+      item.note = ""
+    except Exception as e:
+      item.status = "ERROR"
+      item.note = f"rename failed: {e}"
+
+
+def write_report(repo_root: Path, plan: List[PlanItem], prefix: str) -> Path:
   reports_dir = repo_root / "reports"
   reports_dir.mkdir(parents=True, exist_ok=True)
 
   stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-  report_path = reports_dir / f"preview_{stamp}.csv"
+  report_path = reports_dir / f"{prefix}_{stamp}.csv"
 
   with report_path.open("w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
@@ -102,27 +130,51 @@ def main() -> None:
   path_str = input("請輸入要處理的資料夾路徑: ").strip()
   mode = input("請輸入模式 preview 或 apply: ").strip().lower()
 
+  if mode not in ("preview", "apply"):
+    print("模式輸入錯誤，請輸入 preview 或 apply")
+    return
+
   root = Path(path_str).expanduser().resolve()
   if not root.exists() or not root.is_dir():
     print("路徑不存在或不是資料夾")
     return
 
   plan = build_plan(root)
-  report_path = write_report(repo_root, plan)
+
+  preview_report = write_report(repo_root, plan, "preview")
 
   total = len(plan)
   planned = sum(1 for x in plan if x.status == "PLAN")
-  skipped = total - planned
+  skipped = sum(1 for x in plan if x.status == "SKIP")
+  errors = sum(1 for x in plan if x.status == "ERROR")
 
   print(f"總檔案數: {total}")
   print(f"可改名數: {planned}")
   print(f"跳過數: {skipped}")
-  print(f"已輸出報表: {report_path}")
+  print(f"錯誤數: {errors}")
+  print(f"已輸出預覽報表: {preview_report}")
 
-  if mode == "apply":
-    print("apply 目前尚未執行改名，只先產生報表，下一步會加入真正改名流程")
-  else:
+  if mode == "preview":
     print("preview 完成")
+    return
+
+  confirm = input("即將執行改名，是否繼續 (y/n): ").strip().lower()
+  if confirm not in ("y", "yes"):
+    print("已取消，未進行改名")
+    return
+
+  apply_plan(plan)
+
+  apply_report = write_report(repo_root, plan, "apply")
+
+  done = sum(1 for x in plan if x.status == "DONE")
+  skipped2 = sum(1 for x in plan if x.status == "SKIP")
+  errors2 = sum(1 for x in plan if x.status == "ERROR")
+
+  print(f"改名完成數: {done}")
+  print(f"跳過數: {skipped2}")
+  print(f"錯誤數: {errors2}")
+  print(f"已輸出改名結果報表: {apply_report}")
 
 
 if __name__ == "__main__":
