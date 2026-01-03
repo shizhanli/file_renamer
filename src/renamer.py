@@ -54,8 +54,7 @@ def build_plan(root: Path) -> List[PlanItem]:
     counter_by_second: dict[str, int] = {}
 
     for p in items:
-      st = p.stat()
-      mtime = st.st_mtime
+      mtime = p.stat().st_mtime
       ts = format_ts(mtime)
 
       counter_by_second[ts] = counter_by_second.get(ts, 0) + 1
@@ -76,8 +75,7 @@ def build_plan(root: Path) -> List[PlanItem]:
       else:
         status = "PLAN"
         note = ""
-
-      planned_targets.add(new_name)
+        planned_targets.add(new_name)
 
       plan.append(
         PlanItem(
@@ -136,9 +134,11 @@ def apply_plan(plan: List[PlanItem]) -> None:
     if not to_apply:
       continue
 
+    # 目前資料夾已存在的檔名集合，用來避免 tmp 名稱撞名
     used_names = {p.name for p in folder.iterdir() if p.is_file()}
     temp_pairs: list[tuple[PlanItem, str]] = []
 
+    # 先為每個 PLAN 建立 tmp 名稱，確保 tmp 不撞名
     for item in to_apply:
       src = folder / item.old_name
       dst = folder / item.new_name
@@ -164,6 +164,7 @@ def apply_plan(plan: List[PlanItem]) -> None:
       used_names.add(tmp_name)
       temp_pairs.append((item, tmp_name))
 
+    # 第 1 階段: 原名 → tmp
     for item, tmp_name in temp_pairs:
       if item.status != "PLAN":
         continue
@@ -175,9 +176,11 @@ def apply_plan(plan: List[PlanItem]) -> None:
         item.status = "ERROR"
         item.note = f"temp rename failed: {e}"
 
+    # 第 2 階段: tmp → 最終名
     for item, tmp_name in temp_pairs:
       if item.status != "PLAN":
         continue
+
       tmp = folder / tmp_name
       dst = folder / item.new_name
 
