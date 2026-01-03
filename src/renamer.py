@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import os
+import re
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List
 
 
 @dataclass
@@ -19,17 +21,40 @@ class PlanItem:
   note: str
 
 
+TS_RE = re.compile(r"^\d{8}_\d{6}_\d{2}$")
+
+
+def is_hidden_name(name: str) -> bool:
+  return name.startswith(".")
+
+
+def is_temp_name(name: str) -> bool:
+  return name.startswith("renamer_tmp_")
+
+
 def format_ts(mtime: float) -> str:
   dt = datetime.fromtimestamp(mtime)
   return dt.strftime("%Y%m%d_%H%M%S")
 
 
-def gather_files(root: Path) -> List[Path]:
-  files: List[Path] = []
+def mtime_iso(mtime: float) -> str:
+  return datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+
+
+def looks_like_target_name(filename: str) -> bool:
+  p = Path(filename)
+  stem = p.stem
+  return bool(TS_RE.match(stem))
+
+
+def gather_files(root: Path) -> list[Path]:
+  files: list[Path] = []
   for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+    dirnames[:] = [d for d in dirnames if not is_hidden_name(d)]
     for fn in filenames:
-      if fn.startswith("."):
+      if is_hidden_name(fn):
+        continue
+      if is_temp_name(fn):
         continue
       p = Path(dirpath) / fn
       if p.is_file():
@@ -37,68 +62,80 @@ def gather_files(root: Path) -> List[Path]:
   return files
 
 
-def build_plan(root: Path) -> List[PlanItem]:
+def build_plan(root: Path) -> list[PlanItem]:
   all_files = gather_files(root)
 
-  by_folder: dict[Path, List[Path]] = {}
+  by_folder: dict[Path, list[Path]] = {}
   for p in all_files:
     by_folder.setdefault(p.parent, []).append(p)
 
-  plan: List[PlanItem] = []
+  plan: list[PlanItem] = []
 
   for folder, items in sorted(by_folder.items(), key=lambda x: str(x[0])):
     items.sort(key=lambda p: (p.stat().st_mtime, p.name))
 
     existing_names = {p.name for p in items}
-    planned_targets: set[str] = set()
+    folder_plan: list[PlanItem] = []
+
     counter_by_second: dict[str, int] = {}
 
     for p in items:
-      mtime = p.stat().st_mtime
-      ts = format_ts(mtime)
-
+      st = p.stat()
+      ts = format_ts(st.st_mtime)
       counter_by_second[ts] = counter_by_second.get(ts, 0) + 1
       seq = counter_by_second[ts]
 
       new_name = f"{ts}_{seq:02d}{p.suffix}"
-      mtime_iso = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+      item = PlanItem(
+        folder=str(folder),
+        old_name=p.name,
+        new_name=new_name,
+        mtime_iso=mtime_iso(st.st_mtime),
+        status="PLAN",
+        note="",
+      )
 
       if new_name == p.name:
-        status = "SKIP"
-        note = "already named"
-      elif new_name in planned_targets:
-        status = "SKIP"
-        note = "duplicate target in plan"
-      elif new_name in existing_names:
-        status = "SKIP"
-        note = "target exists"
-      else:
-        status = "PLAN"
-        note = ""
-        planned_targets.add(new_name)
+        item.status = "SKIP"
+        item.note = "already named"
 
-      plan.append(
-        PlanItem(
-          folder=str(folder),
-          old_name=p.name,
-          new_name=new_name,
-          mtime_iso=mtime_iso,
-          status=status,
-          note=note,
-        )
-      )
+      folder_plan.append(item)
+
+    seen_targets: set[str] = set()
+    for item in folder_plan:
+      if item.status != "PLAN":
+        continue
+      if item.new_name in seen_targets:
+        item.status = "SKIP"
+        item.note = "duplicate target in plan"
+      else:
+        seen_targets.add(item.new_name)
+
+    changed = True
+    while changed:
+      changed = False
+      vacated = {x.old_name for x in folder_plan if x.status == "PLAN"}
+      for item in folder_plan:
+        if item.status != "PLAN":
+          continue
+        if item.new_name in existing_names and item.new_name not in vacated:
+          item.status = "SKIP"
+          item.note = "target exists"
+          changed = True
+
+    plan.extend(folder_plan)
 
   return plan
 
 
-def write_report(repo_root: Path, prefix: str, plan: List[PlanItem]) -> Path:
+def write_report(repo_root: Path, prefix: str, plan: list[PlanItem]) -> Path:
   reports_dir = repo_root / "reports"
   reports_dir.mkdir(parents=True, exist_ok=True)
 
   stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
   report_path = reports_dir / f"{prefix}_{stamp}.csv"
 
-  with report_path.open("w", newline="", encoding="utf-8-sig") as f:
+  with report_path.open("w", newline="", encoding="utf_8_sig") as f:
     w = csv.writer(f)
     w.writerow(["folder", "old_name", "new_name", "mtime", "status", "note"])
     for item in plan:
@@ -107,7 +144,7 @@ def write_report(repo_root: Path, prefix: str, plan: List[PlanItem]) -> Path:
   return report_path
 
 
-def summarize(plan: List[PlanItem]) -> dict[str, int]:
+def summarize(plan: list[PlanItem]) -> dict[str, int]:
   counts: dict[str, int] = {}
   for item in plan:
     counts[item.status] = counts.get(item.status, 0) + 1
@@ -124,8 +161,18 @@ def print_summary(title: str, counts: dict[str, int]) -> None:
   print(f"錯誤數: {counts.get('ERROR', 0)}")
 
 
-def apply_plan(plan: List[PlanItem]) -> None:
-  by_folder: dict[Path, List[PlanItem]] = {}
+def make_temp_name(used_names: set[str], suffix: str) -> str:
+  while True:
+    token = uuid.uuid4().hex
+    tmp_name = f"renamer_tmp_{token}{suffix}"
+    if tmp_name in used_names:
+      continue
+    used_names.add(tmp_name)
+    return tmp_name
+
+
+def apply_plan(plan: list[PlanItem]) -> None:
+  by_folder: dict[Path, list[PlanItem]] = {}
   for item in plan:
     by_folder.setdefault(Path(item.folder), []).append(item)
 
@@ -134,11 +181,16 @@ def apply_plan(plan: List[PlanItem]) -> None:
     if not to_apply:
       continue
 
-    # 目前資料夾已存在的檔名集合，用來避免 tmp 名稱撞名
+    if not folder.exists() or not folder.is_dir():
+      for item in to_apply:
+        item.status = "ERROR"
+        item.note = "folder missing"
+      continue
+
     used_names = {p.name for p in folder.iterdir() if p.is_file()}
+
     temp_pairs: list[tuple[PlanItem, str]] = []
 
-    # 先為每個 PLAN 建立 tmp 名稱，確保 tmp 不撞名
     for item in to_apply:
       src = folder / item.old_name
       dst = folder / item.new_name
@@ -154,17 +206,9 @@ def apply_plan(plan: List[PlanItem]) -> None:
         continue
 
       suffix = Path(item.old_name).suffix
-      token = uuid.uuid4().hex
-      tmp_name = f"renamer_tmp_{token}{suffix}"
-
-      while tmp_name in used_names or (folder / tmp_name).exists():
-        token = uuid.uuid4().hex
-        tmp_name = f"renamer_tmp_{token}{suffix}"
-
-      used_names.add(tmp_name)
+      tmp_name = make_temp_name(used_names, suffix)
       temp_pairs.append((item, tmp_name))
 
-    # 第 1 階段: 原名 → tmp
     for item, tmp_name in temp_pairs:
       if item.status != "PLAN":
         continue
@@ -176,17 +220,28 @@ def apply_plan(plan: List[PlanItem]) -> None:
         item.status = "ERROR"
         item.note = f"temp rename failed: {e}"
 
-    # 第 2 階段: tmp → 最終名
     for item, tmp_name in temp_pairs:
       if item.status != "PLAN":
         continue
 
       tmp = folder / tmp_name
       dst = folder / item.new_name
+      src = folder / item.old_name
+
+      if not tmp.exists():
+        item.status = "ERROR"
+        item.note = "temp file missing"
+        continue
 
       if dst.exists():
         item.status = "ERROR"
         item.note = "target exists after temp step"
+        try:
+          if not src.exists():
+            tmp.rename(src)
+            item.note = "target exists after temp step, rolled back"
+        except Exception as e:
+          item.note = f"target exists after temp step, rollback failed: {e}"
         continue
 
       try:
@@ -196,13 +251,34 @@ def apply_plan(plan: List[PlanItem]) -> None:
       except Exception as e:
         item.status = "ERROR"
         item.note = f"final rename failed: {e}"
+        try:
+          if tmp.exists() and not src.exists():
+            tmp.rename(src)
+            item.note = f"final rename failed: {e}, rolled back"
+        except Exception as e2:
+          item.note = f"final rename failed: {e}, rollback failed: {e2}"
+
+
+def parse_args() -> argparse.Namespace:
+  p = argparse.ArgumentParser(description="Rename files by mtime with preview/apply modes and CSV reports.")
+  p.add_argument("--path", default=None, help="要處理的資料夾路徑，未提供則改用互動輸入")
+  p.add_argument("--mode", default=None, choices=["preview", "apply"], help="preview 或 apply，未提供則改用互動輸入")
+  return p.parse_args()
 
 
 def main() -> None:
+  args = parse_args()
   repo_root = Path(__file__).resolve().parent.parent
 
-  path_str = input("請輸入要處理的資料夾路徑: ").strip()
-  mode = input("請輸入模式 preview 或 apply: ").strip().lower()
+  if args.path is None:
+    path_str = input("請輸入要處理的資料夾路徑: ").strip()
+  else:
+    path_str = str(args.path).strip()
+
+  if args.mode is None:
+    mode = input("請輸入模式 preview 或 apply: ").strip().lower()
+  else:
+    mode = str(args.mode).strip().lower()
 
   if mode not in ("preview", "apply"):
     print("模式只能是 preview 或 apply")
@@ -216,8 +292,7 @@ def main() -> None:
   plan = build_plan(root)
 
   preview_report = write_report(repo_root, "preview", plan)
-  preview_counts = summarize(plan)
-  print_summary("預覽結果", preview_counts)
+  print_summary("預覽結果", summarize(plan))
   print(f"已輸出預覽報表: {preview_report}")
 
   if mode == "preview":
@@ -232,10 +307,13 @@ def main() -> None:
   apply_plan(plan)
 
   apply_report = write_report(repo_root, "apply", plan)
-  apply_counts = summarize(plan)
-  print_summary("套用結果", apply_counts)
+  print_summary("套用結果", summarize(plan))
   print(f"已輸出執行報表: {apply_report}")
 
 
 if __name__ == "__main__":
-  main()
+  try:
+    main()
+  except KeyboardInterrupt:
+    print("\n已中止")
+    sys.exit(130)
