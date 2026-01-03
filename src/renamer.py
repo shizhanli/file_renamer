@@ -54,12 +54,15 @@ def build_plan(root: Path) -> List[PlanItem]:
     counter_by_second: dict[str, int] = {}
 
     for p in items:
-      mtime = p.stat().st_mtime
+      st = p.stat()
+      mtime = st.st_mtime
       ts = format_ts(mtime)
+
       counter_by_second[ts] = counter_by_second.get(ts, 0) + 1
       seq = counter_by_second[ts]
 
       new_name = f"{ts}_{seq:02d}{p.suffix}"
+      mtime_iso = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
 
       if new_name == p.name:
         status = "SKIP"
@@ -81,7 +84,7 @@ def build_plan(root: Path) -> List[PlanItem]:
           folder=str(folder),
           old_name=p.name,
           new_name=new_name,
-          mtime_iso=datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+          mtime_iso=mtime_iso,
           status=status,
           note=note,
         )
@@ -106,6 +109,23 @@ def write_report(repo_root: Path, prefix: str, plan: List[PlanItem]) -> Path:
   return report_path
 
 
+def summarize(plan: List[PlanItem]) -> dict[str, int]:
+  counts: dict[str, int] = {}
+  for item in plan:
+    counts[item.status] = counts.get(item.status, 0) + 1
+  counts["TOTAL"] = len(plan)
+  return counts
+
+
+def print_summary(title: str, counts: dict[str, int]) -> None:
+  print(title)
+  print(f"總檔案數: {counts.get('TOTAL', 0)}")
+  print(f"可改名數: {counts.get('PLAN', 0)}")
+  print(f"已完成數: {counts.get('DONE', 0)}")
+  print(f"跳過數: {counts.get('SKIP', 0)}")
+  print(f"錯誤數: {counts.get('ERROR', 0)}")
+
+
 def apply_plan(plan: List[PlanItem]) -> None:
   by_folder: dict[Path, List[PlanItem]] = {}
   for item in plan:
@@ -117,7 +137,7 @@ def apply_plan(plan: List[PlanItem]) -> None:
       continue
 
     used_names = {p.name for p in folder.iterdir() if p.is_file()}
-    temp_map: dict[PlanItem, str] = {}
+    temp_pairs: list[tuple[PlanItem, str]] = []
 
     for item in to_apply:
       src = folder / item.old_name
@@ -136,14 +156,15 @@ def apply_plan(plan: List[PlanItem]) -> None:
       suffix = Path(item.old_name).suffix
       token = uuid.uuid4().hex
       tmp_name = f"renamer_tmp_{token}{suffix}"
+
       while tmp_name in used_names or (folder / tmp_name).exists():
         token = uuid.uuid4().hex
         tmp_name = f"renamer_tmp_{token}{suffix}"
 
       used_names.add(tmp_name)
-      temp_map[item] = tmp_name
+      temp_pairs.append((item, tmp_name))
 
-    for item, tmp_name in temp_map.items():
+    for item, tmp_name in temp_pairs:
       if item.status != "PLAN":
         continue
       src = folder / item.old_name
@@ -154,7 +175,7 @@ def apply_plan(plan: List[PlanItem]) -> None:
         item.status = "ERROR"
         item.note = f"temp rename failed: {e}"
 
-    for item, tmp_name in temp_map.items():
+    for item, tmp_name in temp_pairs:
       if item.status != "PLAN":
         continue
       tmp = folder / tmp_name
@@ -192,12 +213,8 @@ def main() -> None:
   plan = build_plan(root)
 
   preview_report = write_report(repo_root, "preview", plan)
-  total = len(plan)
-  planned = sum(1 for x in plan if x.status == "PLAN")
-  skipped = sum(1 for x in plan if x.status == "SKIP")
-  print(f"總檔案數: {total}")
-  print(f"可改名數: {planned}")
-  print(f"跳過數: {skipped}")
+  preview_counts = summarize(plan)
+  print_summary("預覽結果", preview_counts)
   print(f"已輸出預覽報表: {preview_report}")
 
   if mode == "preview":
@@ -211,14 +228,9 @@ def main() -> None:
 
   apply_plan(plan)
 
-  done = sum(1 for x in plan if x.status == "DONE")
-  error = sum(1 for x in plan if x.status == "ERROR")
-  skipped2 = sum(1 for x in plan if x.status == "SKIP")
   apply_report = write_report(repo_root, "apply", plan)
-
-  print(f"已完成改名數: {done}")
-  print(f"跳過數: {skipped2}")
-  print(f"錯誤數: {error}")
+  apply_counts = summarize(plan)
+  print_summary("套用結果", apply_counts)
   print(f"已輸出執行報表: {apply_report}")
 
 
